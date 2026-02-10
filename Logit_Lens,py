@@ -1,0 +1,50 @@
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+import sqlite3
+import torch.nn.functional as F
+
+# 1. Setup Model and DB
+model_name = "gpt2"  # Start small; use "meta-llama/Llama-2-7b-hf" for larger runs
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+model = AutoModelForCausalLM.from_pretrained(model_name, output_hidden_states=True)
+
+conn = sqlite3.connect("logit_lens_trace.db")
+cursor = conn.cursor()
+cursor.execute('''CREATE TABLE IF NOT EXISTS traces 
+               (prompt_id TEXT, layer INTEGER, input_token_idx INTEGER, 
+                predicted_token TEXT, probability REAL)''')
+
+def run_logit_lens(prompt, prompt_id="run_01"):
+    inputs = tokenizer(prompt, return_tensors="pt")
+    input_ids = inputs['input_ids']
+    
+    with torch.no_grad():
+        outputs = model(**inputs)
+        # hidden_states is a tuple of (embedding_layer, layer_1, layer_2, ..., layer_n)
+        hidden_states = outputs.hidden_states 
+
+    # The model's final norm and head are needed to "decode" hidden states
+    final_norm = model.transformer.ln_f if hasattr(model.transformer, 'ln_f') else model.model.norm
+    lm_head = model.lm_head
+
+    for layer_idx, state in enumerate(hidden_states):
+        # Apply final layer norm and LM head to the intermediate state
+        logits = lm_head(final_norm(state))
+        probs = F.softmax(logits, dim=-1)
+        
+        # Get top prediction for each position in the prompt
+        top_probs, top_ids = torch.max(probs, dim=-1)
+        
+        for token_pos in range(input_ids.shape[1]):
+            pred_id = top_ids[0, token_pos].item()
+            pred_token = tokenizer.decode([pred_id])
+            prob = top_probs[0, token_pos].item()
+            
+            cursor.execute("INSERT INTO traces VALUES (?, ?, ?, ?, ?)",
+                           (prompt_id, layer_idx, token_pos, pred_token, prob))
+    
+    conn.commit()
+    print(f"Trace complete for: {prompt}")
+
+# Example Run
+run_logit_lens("The capital of France is")
